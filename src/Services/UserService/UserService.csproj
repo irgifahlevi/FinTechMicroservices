@@ -23,6 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\BuildingBlocks\Common\Common\Common.csproj" />
     <ProjectReference Include="..\..\BuildingBlocks\EventBus\EventBus\EventBus.csproj" />
   </ItemGroup>
 
