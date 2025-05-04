@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
+using System.Data;
 using System.Security.Claims;
 using UserService.Domain.Models;
 
@@ -11,10 +12,15 @@ namespace UserService.Data
     public class AppDbContext : IdentityDbContext<AppUser, IdentityRole<Guid>, Guid>
     {
         private readonly IHttpContextAccessor _httpContextAccessor;
+        private readonly ILogger<AppDbContext> _logger;
 
-        public AppDbContext(DbContextOptions<AppDbContext> options, IHttpContextAccessor httpContextAccessor ) : base( options )
+        public AppDbContext(
+            DbContextOptions<AppDbContext> options,
+            IHttpContextAccessor httpContextAccessor,
+            ILogger<AppDbContext> logger) : base(options)
         {
             _httpContextAccessor = httpContextAccessor;
+            _logger = logger;
         }
 
         public DbSet<UserProfile> UserProfiles { get; set; }
@@ -24,53 +30,90 @@ namespace UserService.Data
         {
             base.OnModelCreating(builder);
 
+            // Configure BaseEntity properties for all entities that inherit from it
+            foreach (var entityType in builder.Model.GetEntityTypes()
+                .Where(e => typeof(BaseEntity).IsAssignableFrom(e.ClrType)))
+            {
+                builder.Entity(entityType.ClrType, e =>
+                {
+                    e.Property(nameof(BaseEntity.CreatedTime))
+                        .HasDefaultValueSql("GETUTCDATE()");
+
+                    e.Property(nameof(BaseEntity.LastModifiedTime))
+                        .IsConcurrencyToken();
+                });
+            }
+
+            // Configure UserProfile specifically
             builder.Entity<UserProfile>(e =>
             {
-                e.Property(b => b.CreatedTime).HasDefaultValueSql("GETUTCDATE()");
-                e.Property(b => b.LastModifiedTime).IsConcurrencyToken();
+                e.HasIndex(p => p.UserId).IsUnique();
+                e.Property(p => p.TaxNumber).HasMaxLength(20);
             });
 
+            // Configure AuditLog
             builder.Entity<AuditLog>(e =>
             {
-                e.Property(b => b.CreatedTime).HasDefaultValueSql("GETUTCDATE()");
-                e.Property(b => b.LastModifiedTime).IsConcurrencyToken();
+                e.HasIndex(a => new { a.TableName, a.KeyValues });
+                e.Property(a => a.Action).HasMaxLength(20);
             });
 
-            // relationships
-            builder.Entity<AppUser>()
-                .HasOne(a => a.Profile)
-                .WithOne(p => p.User)
-                .HasForeignKey<UserProfile>(p => p.UserId)
-                .OnDelete(DeleteBehavior.Cascade);
+            // Configure AppUser relationships
+            builder.Entity<AppUser>(e =>
+            {
+                e.HasOne(a => a.Profile)
+                    .WithOne(p => p.User)
+                    .HasForeignKey<UserProfile>(p => p.UserId)
+                    .OnDelete(DeleteBehavior.Cascade);
+            });
         }
 
-        public override int SaveChanges()
+        public override int SaveChanges(bool acceptAllChangesOnSuccess)
         {
-            return base.SaveChanges();
+            try
+            {
+                SetBaseEntityFields();
+                return base.SaveChanges(acceptAllChangesOnSuccess);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Concurrency violation occurred");
+                throw new Exception("Data was modified by another process. Please refresh and try again.", ex);
+            }
         }
 
-        public override async Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+        public override async Task<int> SaveChangesAsync(
+            bool acceptAllChangesOnSuccess,
+            CancellationToken cancellationToken = default)
         {
-            SetBaseEntityFields();
-            await AuditChanges();
-            return await base.SaveChangesAsync(cancellationToken);
+            try
+            {
+                SetBaseEntityFields();
+                await AuditChangesAsync(cancellationToken);
+                return await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Concurrency violation occurred");
+                throw new Exception("Data was modified by another process. Please refresh and try again.", ex);
+            }
         }
 
         private void SetBaseEntityFields()
         {
-            var userId = _httpContextAccessor?.HttpContext?.User?.FindFirstValue(ClaimTypes.NameIdentifier);
-
+            var userId = GetCurrentUserId();
             var now = DateTime.UtcNow;
 
-            foreach(var entry in ChangeTracker.Entries<BaseEntity>())
+            foreach (var entry in ChangeTracker.Entries<BaseEntity>())
             {
                 switch (entry.State)
                 {
                     case EntityState.Added:
-                        entry.Entity.CreatedBy = userId ?? "SYSTEM";
+                        entry.Entity.CreatedBy = userId;
                         entry.Entity.CreatedTime = now;
                         entry.Entity.RowStatus = true;
                         break;
+
                     case EntityState.Modified:
                         entry.Entity.LastModifiedBy = userId;
                         entry.Entity.LastModifiedTime = now;
@@ -79,12 +122,21 @@ namespace UserService.Data
             }
         }
 
-        private async Task AuditChanges()
+        private async Task AuditChangesAsync(CancellationToken cancellationToken)
         {
             var auditEntries = OnBeforeSaveChanges();
-            if(auditEntries.Any())
+            if (auditEntries.Count == 0) return;
+
+            try
             {
-                await AuditLogs.AddRangeAsync(auditEntries.Select(Q => Q.ToAudit()));
+                await AuditLogs.AddRangeAsync(
+                    auditEntries.Select(e => e.ToAudit()),
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to save audit logs");
+                // Continue without audit if failed
             }
         }
 
@@ -93,25 +145,23 @@ namespace UserService.Data
             ChangeTracker.DetectChanges();
             var entries = new List<AuditEntry>();
 
-            foreach(var entry in ChangeTracker.Entries())
+            foreach (var entry in ChangeTracker.Entries()
+                .Where(e => e.State != EntityState.Detached &&
+                            e.State != EntityState.Unchanged &&
+                            e.Entity is not AuditLog))
             {
-                if(entry.Entity is AuditLog || entry.State == EntityState.Detached ||  entry.State == EntityState.Unchanged)
-                    continue;
-
                 var auditEntry = new AuditEntry(entry)
-                { 
-                    TableName = entry.Metadata.GetTableName(),
-                    UserId = _httpContextAccessor?.HttpContext?.User?.FindFirstValue(ClaimTypes.NameIdentifier)
+                {
+                    TableName = entry.Metadata.GetTableName() ?? entry.Metadata.ShortName(),
+                    UserId = GetCurrentUserId()
                 };
 
                 entries.Add(auditEntry);
 
-                foreach (var property in entry.Properties)
+                foreach (var property in entry.Properties.Where(p => !p.IsTemporary))
                 {
-                    if (property.IsTemporary) 
-                        continue;
+                    var propertyName = property.Metadata.Name;
 
-                    string propertyName = property.Metadata.Name;
                     if (property.Metadata.IsPrimaryKey())
                     {
                         auditEntry.KeyValues[propertyName] = property.CurrentValue!;
@@ -123,21 +173,26 @@ namespace UserService.Data
                         case EntityState.Added:
                             auditEntry.NewValues[propertyName] = property.CurrentValue!;
                             break;
+
                         case EntityState.Deleted:
                             auditEntry.OldValues[propertyName] = property.OriginalValue!;
                             break;
-                        case EntityState.Modified:
-                            if (property.IsModified)
-                            {
-                                auditEntry.OldValues[propertyName] = property.OriginalValue!;
-                                auditEntry.NewValues[propertyName] = property.CurrentValue!;
-                            }
+
+                        case EntityState.Modified when property.IsModified:
+                            auditEntry.OldValues[propertyName] = property.OriginalValue!;
+                            auditEntry.NewValues[propertyName] = property.CurrentValue!;
                             break;
                     }
                 }
             }
 
             return entries;
+        }
+
+        private string GetCurrentUserId()
+        {
+            return _httpContextAccessor.HttpContext?.User?
+                .FindFirstValue(ClaimTypes.NameIdentifier) ?? "SYSTEM";
         }
     }
 }

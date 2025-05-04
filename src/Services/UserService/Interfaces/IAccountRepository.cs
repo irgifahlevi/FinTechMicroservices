@@ -5,8 +5,8 @@ namespace UserService.Interfaces
 {
     public interface IAccountRepository
     {
-        Task<AppUser> GetByIdAsync(Guid id);
-        Task<AppUser> GetByEmailAsync(string email);
+        Task<AppUser> GetByIdAsync(Guid id, bool includeProfile = false);
+        Task<AppUser> GetByEmailAsync(string email, bool includeProfile = false);
         Task<bool> CheckPasswordAsync(AppUser user, string password);
         Task<IdentityResult> CreateAsync(AppUser user, string password);
         Task<IdentityResult> UpdateAsync(AppUser user);

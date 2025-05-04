@@ -1,4 +1,6 @@
 ﻿using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using System.Security.Claims;
 using UserService.Data;
 using UserService.Domain.Models;
 using UserService.Interfaces;
@@ -10,60 +12,76 @@ namespace UserService.Repositories
         private readonly AppDbContext _context;
         private readonly UserManager<AppUser> _userManager;
 
-        public AccountRepository(AppDbContext context, UserManager<AppUser> userManager)
+        public AccountRepository(
+            AppDbContext context, 
+            UserManager<AppUser> userManager
+            )
         {
             _context = context;
             _userManager = userManager;
         }
 
-        public Task<bool> CheckPasswordAsync(AppUser user, string password)
+        public async Task<AppUser> GetByIdAsync(Guid id, bool includeProfile = false)
         {
-            throw new NotImplementedException();
+            var query = _userManager.Users;
+
+            if (includeProfile) 
+                query = query.Include(Q => Q.Profile);
+
+            return await query.FirstOrDefaultAsync(Q => Q.Id == id);
         }
 
-        public Task<IdentityResult> ConfirmEmailAsync(AppUser user, string token)
+
+        public async Task<AppUser> GetByEmailAsync(string email, bool includeProfile = false)
         {
-            throw new NotImplementedException();
+            var query = _userManager.Users;
+
+            if (!includeProfile)
+                query = query.Include(Q => Q.Profile);
+
+            return await query.FirstOrDefaultAsync(Q => Q.Email == email);
         }
 
-        public Task<IdentityResult> CreateAsync(AppUser user, string password)
+        public async Task<bool> CheckPasswordAsync(AppUser user, string password)
         {
-            throw new NotImplementedException();
+            return await _userManager.CheckPasswordAsync(user, password); ;
         }
 
-        public Task<string> GenerateEmailConfirmationTokenAsync(AppUser user)
+        public async Task<IdentityResult> CreateAsync(AppUser user, string password)
         {
-            throw new NotImplementedException();
+            return await _userManager.CreateAsync(user, password);
         }
 
-        public Task<string> GeneratePasswordResetTokenAsync(AppUser user)
+        public async Task<IdentityResult> UpdateAsync(AppUser user)
         {
-            throw new NotImplementedException();
+            return await _userManager.UpdateAsync(user);
         }
 
-        public Task<AppUser> GetByEmailAsync(string email)
+        public async Task<IdentityResult> ConfirmEmailAsync(AppUser user, string token)
         {
-            throw new NotImplementedException();
+            return await _userManager.ConfirmEmailAsync(user, token);
         }
 
-        public Task<AppUser> GetByIdAsync(Guid id)
+        public async Task<string> GenerateEmailConfirmationTokenAsync(AppUser user)
         {
-            throw new NotImplementedException();
+            return await _userManager.GenerateEmailConfirmationTokenAsync(user);
         }
 
-        public Task<IdentityResult> ResetPasswordAsync(AppUser user, string token, string newPassword)
+        public async Task<string> GeneratePasswordResetTokenAsync(AppUser user)
         {
-            throw new NotImplementedException();
+            return await _userManager.GeneratePasswordResetTokenAsync(user);
         }
 
-        public Task<IdentityResult> UpdateAsync(AppUser user)
+        public async Task<IdentityResult> ResetPasswordAsync(AppUser user, string token, string newPassword)
         {
-            throw new NotImplementedException();
+            return await _userManager.ResetPasswordAsync(user, token, newPassword);
         }
 
-        public Task UpdateRefreshToken(AppUser user, string refreshToken, DateTime expiry)
+        public async Task UpdateRefreshToken(AppUser user, string refreshToken, DateTime expiry)
         {
-            throw new NotImplementedException();
+            user.RefreshToken = refreshToken;
+            user.RefreshTokenExpiry = expiry;
+            await _userManager.UpdateAsync(user);
         }
     }
 }

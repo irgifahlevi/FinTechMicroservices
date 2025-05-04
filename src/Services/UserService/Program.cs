@@ -2,6 +2,8 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using UserService.Data;
 using UserService.Domain.Models;
+using UserService.Interfaces;
+using UserService.Repositories;
 
 var builder = WebApplication.CreateBuilder(args);
 var connections = builder.Configuration;
@@ -18,6 +20,10 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(connections.GetConnectionString("Default"))
            .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking);
 });
+
+builder.Services.AddScoped<IAuditService, AuditService>();
+builder.Services.AddScoped<IAccountRepository, AccountRepository>();
+builder.Services.AddScoped<IAccountService, AccountService>();
 
 builder.Services.AddIdentity<AppUser, IdentityRole<Guid>>(options =>
     {

@@ -1,4 +1,6 @@
 ﻿using Common.Entities;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using System.Security.Claims;
 using System.Text.Json;
 using UserService.Data;
@@ -18,42 +20,127 @@ namespace UserService.Repositories
             IHttpContextAccessor httpContextAccessor,
             ILogger<AuditService> logger)
         {
-            _context = context;
-            _httpContextAccessor = httpContextAccessor;
-            _logger = logger;
+            _context = context ?? throw new ArgumentNullException(nameof(context));
+            _httpContextAccessor = httpContextAccessor ?? throw new ArgumentNullException(nameof(httpContextAccessor));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
-        public async Task LogChangesAsync<TEntity>(TEntity oldEntity, TEntity newEntity, string userId) where TEntity : BaseEntity
+        public async Task<List<AuditLog>> GetRecentEntityLogsAsync(string entityName, string entityId, int count = 10)
         {
             try
             {
-                var oldValues = new Dictionary<string, object>();
-                var newValues = new Dictionary<string, object>();
-                var changedColumns = new List<string>();
+                return await _context.AuditLogs
+                    .Where(a => a.TableName == entityName && a.KeyValues.Contains(entityId))
+                    .OrderByDescending(a => a.CreatedTime)
+                    .Take(count)
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error retrieving recent logs for {entityName} with ID {entityId}");
+                throw;
+            }
+        }
 
-                var properties = typeof(TEntity).GetProperties();
-                foreach (var prop in properties)
+        public async Task<List<AuditLog>> GetUserActivityLogsAsync(string userId, int count = 10)
+        {
+            try
+            {
+                return await _context.AuditLogs
+                    .Where(a => a.CreatedBy == userId)
+                    .OrderByDescending(a => a.CreatedTime)
+                    .Take(count)
+                    .ToListAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error retrieving activity logs for user {userId}");
+                throw;
+            }
+        }
+
+        public async Task LogChangesAsync(string entityName, string entityId, object oldValues, object newValues, string userId)
+        {
+            try
+            {
+                var auditLog = new AuditLog
                 {
-                    var oldValue = prop.GetValue(oldEntity);
-                    var newValue = prop.GetValue(newEntity);
+                    TableName = entityName,
+                    Action = "UPDATE",
+                    KeyValues = JsonSerializer.Serialize(new { Id = entityId }),
+                    OldValues = oldValues != null ? JsonSerializer.Serialize(oldValues) : null,
+                    NewValues = newValues != null ? JsonSerializer.Serialize(newValues) : null,
+                    AffectedColumns = null,
+                    CreatedBy = string.IsNullOrEmpty(userId) ? GetCurrentUserId() : userId,
+                    CreatedTime = DateTime.UtcNow,
+                };
 
-                    if (!Equals(oldValue, newValue))
+                await _context.AuditLogs.AddAsync(auditLog);
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error logging changes for {entityName} with ID {entityId}");
+                throw;
+            }
+        }
+
+        public async Task LogCustomEventAsync(string tableName, string action, string entityId, Dictionary<string, object> additionalData = null)
+        {
+            try
+            {
+                var auditLog = new AuditLog
+                {
+                    TableName = tableName,
+                    Action = action,
+                    KeyValues = JsonSerializer.Serialize(new { Id = entityId }),
+                    OldValues = null,
+                    NewValues = additionalData != null ? JsonSerializer.Serialize(additionalData) : null,
+                    AffectedColumns = null,
+                    CreatedBy = GetCurrentUserId(),
+                    CreatedTime = DateTime.UtcNow,
+                };
+
+                await _context.AuditLogs.AddAsync(auditLog);
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex) 
+            {
+                _logger.LogError(ex, $"Error logging custom event '{action}' for {tableName}, with ID {entityId}");
+                throw;
+            }
+        }
+
+        public async Task LogSecurityEventAsync(string userId, string eventType, string ipAddress = null, string userAgent = null, Dictionary<string, object> details = null)
+        {
+            try
+            {
+                userId = string.IsNullOrEmpty(userId) ? GetCurrentUserId() : userId;
+
+                var securityData = new Dictionary<string, object>
+                {
+                    ["IPAddress"] = ipAddress ?? GetClientIpAddress(),
+                    ["UserAgent"] = userAgent ?? GetUserAgent(),
+                    ["Timestamp"] = DateTime.UtcNow.ToString("o")
+                };
+
+                if (details != null)
+                {
+                    foreach (var item in details)
                     {
-                        oldValues[prop.Name] = oldValue;
-                        newValues[prop.Name] = newValue;
-                        changedColumns.Add(prop.Name);
+                        securityData[item.Key] = item.Value;
                     }
                 }
 
                 var auditLog = new AuditLog
                 {
-                    TableName = typeof(TEntity).Name,
-                    Action = "UPDATE",
-                    KeyValues = JsonSerializer.Serialize(new { Id = newEntity.Id }),
-                    OldValues = oldValues.Any() ? JsonSerializer.Serialize(oldValues) : null,
-                    NewValues = newValues.Any() ? JsonSerializer.Serialize(newValues) : null,
-                    AffectedColumns = changedColumns.Any() ? string.Join(",", changedColumns) : null,
-                    CreatedBy = userId ?? GetCurrentUserId(),
+                    TableName = "SecurityEvents",
+                    Action = eventType,
+                    KeyValues = JsonSerializer.Serialize(new { UserId = userId }),
+                    OldValues = null,
+                    NewValues = JsonSerializer.Serialize(securityData),
+                    AffectedColumns = null,
+                    CreatedBy = userId,
                     CreatedTime = DateTime.UtcNow
                 };
 
@@ -62,93 +149,49 @@ namespace UserService.Repositories
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to log changes for {Entity}", typeof(TEntity).Name);
+                _logger.LogError(ex, $"Error logging security event '{eventType}' for user {userId}");
                 throw;
             }
         }
 
-        public async Task LogCustomEventAsync(string tableName, string action, string entityId, Dictionary<string, object> additionalData = null)
-        {
-            var auditLog = new AuditLog
-            {
-                TableName = tableName,
-                Action = action,
-                KeyValues = JsonSerializer.Serialize(new { Id = entityId }),
-                OldValues = null,
-                NewValues = additionalData != null ? JsonSerializer.Serialize(additionalData) : null,
-                AffectedColumns = null,
-                CreatedBy = GetCurrentUserId(),
-                CreatedTime = DateTime.UtcNow
-            };
-
-            await _context.AuditLogs.AddAsync(auditLog);
-            await _context.SaveChangesAsync();
-        }
-
         public async Task LogUserActivityAsync(string userId, string action, Dictionary<string, object> metadata = null)
         {
-            var auditLog = new AuditLog
+            try
             {
-                TableName = "UserActivities",
-                Action = action,
-                KeyValues = JsonSerializer.Serialize(new { UserId = userId }),
-                OldValues = null,
-                NewValues = metadata != null ? JsonSerializer.Serialize(metadata) : null,
-                AffectedColumns = null,
-                CreatedBy = userId,
-                CreatedTime = DateTime.UtcNow
-            };
+                userId = string.IsNullOrEmpty(userId) ? GetCurrentUserId() : userId;
 
-            await _context.AuditLogs.AddAsync(auditLog);
-            await _context.SaveChangesAsync();
-        }
-
-        public async Task LogSecurityEventAsync(string userId, string eventType, string ipAddress = null, string userAgent = null, Dictionary<string, object> details = null)
-        {
-            var securityData = new Dictionary<string, object>
-            {
-                ["IPAddress"] = ipAddress ?? GetClientIpAddress(),
-                ["UserAgent"] = userAgent ?? GetUserAgent()
-            };
-
-            if (details != null)
-            {
-                foreach (var item in details)
+                var auditLog = new AuditLog
                 {
-                    securityData[item.Key] = item.Value;
-                }
+                    TableName = "UserActivities",
+                    Action = action,
+                    KeyValues = JsonSerializer.Serialize(new { UserId = userId }),
+                    OldValues = null,
+                    NewValues = metadata != null ? JsonSerializer.Serialize(metadata) : null,
+                    AffectedColumns = null,
+                    CreatedBy = userId,
+                    CreatedTime = DateTime.UtcNow
+                };
+
+                await _context.AuditLogs.AddAsync(auditLog);
+                await _context.SaveChangesAsync();
             }
-
-            var auditLog = new AuditLog
+            catch (Exception ex)
             {
-                TableName = "SecurityEvents",
-                Action = eventType,
-                KeyValues = JsonSerializer.Serialize(new { UserId = userId }),
-                OldValues = null,
-                NewValues = JsonSerializer.Serialize(securityData),
-                AffectedColumns = null,
-                CreatedBy = userId,
-                CreatedTime = DateTime.UtcNow
-            };
-
-            await _context.AuditLogs.AddAsync(auditLog);
-            await _context.SaveChangesAsync();
+                _logger.LogError(ex, $"Error logging user activity '{action}' for user {userId}");
+                throw;
+            }
         }
 
-        public async Task LogBulkChangesAsync(List<AuditEntry> auditEntries)
+        public List<AuditEntry> ProcessChanges(IEnumerable<EntityEntry> entries, string userId)
         {
-            var auditLogs = auditEntries.Select(entry => entry.ToAudit()).ToList();
-
-            // Set common properties
-            auditLogs.ForEach(log =>
-            {
-                log.CreatedBy = log.CreatedBy ?? GetCurrentUserId();
-                log.CreatedTime = DateTime.UtcNow;
-            });
-
-            await _context.AuditLogs.AddRangeAsync(auditLogs);
-            await _context.SaveChangesAsync();
+            throw new NotImplementedException();
         }
+
+        public Task SaveAuditLogsAsync(List<AuditEntry> auditEntries)
+        {
+            throw new NotImplementedException();
+        }
+
 
         #region Helpers
         private string GetCurrentUserId()
@@ -158,7 +201,18 @@ namespace UserService.Repositories
 
         private string GetClientIpAddress()
         {
-            return _httpContextAccessor.HttpContext?.Connection?.RemoteIpAddress?.ToString();
+            if (_httpContextAccessor.HttpContext == null)
+                return null;
+
+            var ip = _httpContextAccessor.HttpContext.Connection?.RemoteIpAddress?.ToString();
+
+            // Check for forwarded headers (for applications behind proxies)
+            if (string.IsNullOrEmpty(ip) && _httpContextAccessor.HttpContext.Request.Headers.ContainsKey("X-Forwarded-For"))
+            {
+                ip = _httpContextAccessor.HttpContext.Request.Headers["X-Forwarded-For"].ToString().Split(',')[0].Trim();
+            }
+
+            return ip;
         }
 
         private string GetUserAgent()
